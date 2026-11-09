@@ -21,7 +21,12 @@ def run_command(args) -> None:
         return  # unreachable; execvp doesn't return
     if getattr(args, "external_supervisor", False):
         os.environ[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
+    from hermes_cli.container_boot import no_supervise_requested
+    no_supervise = (getattr(args, "no_supervise", False) or no_supervise_requested())
+    # A manually started s6 slot remains supervised even if it inherits the opt-out environment.
+    no_supervise = bool(no_supervise and not os.environ.get("HERMES_S6_SUPERVISED_CHILD"))
     run_gateway(
         getattr(args, "verbose", 0), quiet=getattr(args, "quiet", False),
         replace=getattr(args, "replace", False), force=getattr(args, "force", False),
-        idle_exit=getattr(args, "idle_exit", False), control_only=control_only)
+        idle_exit=getattr(args, "idle_exit", False), control_only=control_only,
+        no_supervise=no_supervise)

@@ -8,6 +8,17 @@ import time
 from aiohttp import web
 
 
+def worker_safety(adapter) -> dict:
+    """Capabilities are static; the active mode is captured by the gateway at startup."""
+    runner = getattr(adapter, "gateway_runner", None)
+    return {
+        "protocol_version": 1,
+        "control_only_recovery": True,
+        "no_respawn_serving": True,
+        "no_respawn_enabled": getattr(runner, "_no_respawn_enabled", False) is True,
+    }
+
+
 async def handle_health_detailed(adapter) -> web.Response:
     """Build health data from runtime state and live adapter metrics."""
     from gateway.platforms.api_server import _hermes_version
@@ -19,6 +30,7 @@ async def handle_health_detailed(adapter) -> web.Response:
             "status": "control_only", "mode": "control_only",
             "platform": "hermes-agent", "version": _hermes_version(),
             "gateway_state": "control_only", "readiness": {"status": "control_only"},
+            "worker_safety": worker_safety(adapter),
             "exit_reason": runtime.get("exit_reason"), "pid": os.getpid(),
         })
     from gateway.status import (
@@ -46,6 +58,7 @@ async def handle_health_detailed(adapter) -> web.Response:
     return web.json_response({
         "status": readiness["status"], "readiness": readiness, "platform": "hermes-agent",
         "version": _hermes_version(), "gateway_state": gw_state,
+        "worker_safety": worker_safety(adapter),
         "platforms": platforms,
         "api_server": api_status,
         "metrics_today": api_status["metrics_today"],

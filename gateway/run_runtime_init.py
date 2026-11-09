@@ -55,6 +55,7 @@ class GatewayRuntimeInitMixin:
         """Initialise run/exit/restart flags, per-session state, and completion-delivery bookkeeping."""
         from gateway.run import (Dict, List, MessageEvent, Optional, OrderedDict, Platform, SessionSource, SessionState, SessionTurnLeaseRegistry, asyncio, concurrent, threading, time)
         self._runtime_mode = "control_only" if control_only else "serving"
+        self._no_respawn_enabled = bool(control_only)
         self._running = self._exit_cleanly = self._exit_with_failure = self._draining = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()

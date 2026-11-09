@@ -2277,13 +2277,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         """GET /health — simple health check."""
+        from gateway.platforms.api_server_health import worker_safety
         if getattr(self.gateway_runner, "control_only", False):
             auth_err = self._check_auth(request)
             if auth_err:
                 return auth_err
             return web.json_response({"status": "control_only", "mode": "control_only",
-                                      "platform": "hermes-agent", "version": _hermes_version()})
-        return web.json_response({"status": "ok", "platform": "hermes-agent", "version": _hermes_version()})
+                                      "platform": "hermes-agent", "version": _hermes_version(),
+                                      "worker_safety": worker_safety(self)})
+        return web.json_response({"status": "ok", "platform": "hermes-agent", "version": _hermes_version(),
+                                  "worker_safety": worker_safety(self)})
 
     async def _handle_control_only_refusal(self, request: web.Request) -> web.Response:
         auth_err = self._check_auth(request)
@@ -2339,6 +2342,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_require_auth
     async def _handle_capabilities(self, request: web.Request) -> web.Response:
         """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
+        from gateway.platforms.api_server_health import worker_safety
         runner = getattr(self, "gateway_runner", None)
         features = {
             "chat_completions": True, "chat_completions_streaming": True,
@@ -2349,6 +2353,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "cors": bool(self._cors_origins)}
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
+            "worker_safety": worker_safety(self),
             "model": self._model_name,
             "auth": {"type": "bearer", "required": bool(self._api_key)},
             "runtime": {

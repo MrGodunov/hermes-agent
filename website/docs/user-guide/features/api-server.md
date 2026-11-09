@@ -357,6 +357,14 @@ authenticated UI needs the richer Hermes-specific picker metadata.
 ### GET /v1/capabilities
 
 Returns a machine-readable description of the API server's stable surface for external UIs, orchestrators, and plugin bridges.
+The top-level `worker_safety` object is also present on `/health`, `/v1/health`, and authenticated
+`/health/detailed`. It contains `protocol_version: 1`, `control_only_recovery: true`,
+`no_respawn_serving: true`, and `no_respawn_enabled`, a boolean captured for this boot. The first two
+booleans advertise implemented modes; the last is true only for control-only or an effective
+`--no-supervise` / `HERMES_GATEWAY_NO_SUPERVISE` foreground boot. It does not make claims about
+external supervisors. Control-only retains its restricted route allowlist and does not expose
+`/v1/capabilities`.
+
 
 ```json
 {

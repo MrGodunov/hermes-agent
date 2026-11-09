@@ -5051,9 +5051,9 @@ async def _host_attach_or_none(replace: bool, force: bool = False) -> Optional[b
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
                         verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
-                        control_only: bool = False) -> bool:
+                        control_only: bool = False, no_supervise: bool = False) -> bool:
     from gateway.run_bootstrap import start_gateway as bootstrap
-    return await bootstrap(config, replace, verbosity, force, idle_exit, control_only)
+    return await bootstrap(config, replace, verbosity, force, idle_exit, control_only, no_supervise)
 
 
 def _guard_corrupt_user_config() -> None:

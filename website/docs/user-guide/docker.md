@@ -77,7 +77,7 @@ Port 8642 exposes the gateway's [OpenAI-compatible API server](./features/api-se
 :::tip Gateway runs supervised
 Inside the official Docker image, `gateway run` is **automatically supervised by s6-overlay**: if the gateway process crashes it's restarted within a couple of seconds without losing the container, and the dashboard (when `HERMES_DASHBOARD=1` is set) is supervised alongside it. The `gateway run` CMD process itself is a `sleep infinity` heartbeat that keeps the container alive while s6 manages the actual gateway process — so `docker stop` still shuts everything down cleanly, but `docker logs` shows the supervised gateway's output.
 
-You'll see a one-line breadcrumb in `docker logs` confirming the upgrade. To opt out — and get the historical "gateway is the container's main process, container exit = gateway exit" semantics — pass `--no-supervise` or set `HERMES_GATEWAY_NO_SUPERVISE=1`. The opt-out is useful for CI smoke tests that want the container to exit with the gateway's status code; for production deployments the supervised default is strictly better.
+To opt out, pass `--no-supervise` or set `HERMES_GATEWAY_NO_SUPERVISE=1`. The explicit gateway command then runs in the foreground; s6 registers all persisted profile gateway slots down, preserving their desired state for a later supervised boot. An external supervisor may still restart the container or process independently. The opt-out is useful for CI smoke tests that want the container to exit with the gateway's status code; for production deployments the supervised default is normally preferable.
 
 This behavior applies to the s6-based image only. Earlier (tini-based) images still run `gateway run` as the foreground main process.
 :::

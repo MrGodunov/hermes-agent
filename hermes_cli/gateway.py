@@ -4511,7 +4511,7 @@ def _respawn_storm_backoff() -> None:
 
 
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False,
-                idle_exit: bool = False, control_only: bool = False):
+                idle_exit: bool = False, control_only: bool = False, no_supervise: bool = False):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard;
     idle_exit: a client auto-started this unsupervised gateway, so it exits once idle
@@ -4594,7 +4594,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     success = False
     try:
         success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity,
-                                            idle_exit=idle_exit, control_only=control_only))
+                                            idle_exit=idle_exit, control_only=control_only,
+                                            no_supervise=no_supervise))
         record_exit_event(_exit_diag, "asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
@@ -4888,8 +4889,8 @@ def _maybe_redirect_run_to_s6_supervision(args) -> bool:
     ``HERMES_S6_SUPERVISED_CHILD`` (set by ``S6ServiceManager._render_run_script``) marks the supervised
     child, which must run in foreground or we'd recurse run → start → run; ``--no-supervise`` /
     HERMES_GATEWAY_NO_SUPERVISE=1 opts out (CI smoke, debugging)."""
-    no_supervise = getattr(args, "no_supervise", False) or \
-        os.environ.get("HERMES_GATEWAY_NO_SUPERVISE", "").lower() in ("1", "true", "yes")
+    from hermes_cli.container_boot import no_supervise_requested
+    no_supervise = getattr(args, "no_supervise", False) or no_supervise_requested()
     # HERMES_S6_SUPERVISED_CHILD: we ARE the supervised child; fall through so the gateway starts.
     if no_supervise or os.environ.get("HERMES_S6_SUPERVISED_CHILD"):
         return False

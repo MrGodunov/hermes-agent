@@ -746,7 +746,7 @@ def control_only_host_available() -> bool:
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
                         verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
-                        control_only: bool = False) -> bool:
+                        control_only: bool = False, no_supervise: bool = False) -> bool:
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all; ``idle_exit`` arms the
@@ -843,9 +843,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         resolved_config = await recover_gateway_startup_state(control_only, resolved_config, config)
 
         from gateway.run_runtime import initialize_gateway_runtime, pin_launch_store, unpin_launch_store
+        from hermes_cli.container_boot import no_supervise_requested
         _launch_store_pin = await asyncio.to_thread(pin_launch_store)
         try:
             runner = GatewayRunner(resolved_config, control_only=control_only)
+            runner._no_respawn_enabled = bool(control_only or (
+                (no_supervise or no_supervise_requested())
+                and not os.environ.get("HERMES_S6_SUPERVISED_CHILD")))
         finally:
             unpin_launch_store(_launch_store_pin)
         await initialize_gateway_runtime(runner)

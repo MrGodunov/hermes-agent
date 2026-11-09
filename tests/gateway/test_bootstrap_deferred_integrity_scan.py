@@ -133,6 +133,40 @@ async def test_clean_previous_exit_launches_no_scan(_startup):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("env", "child", "flag", "enabled"), [
+    (None, False, False, False), ("1", False, False, True),
+    ("1", True, False, False), (None, False, True, True),
+    (None, True, True, False),
+])
+async def test_bootstrap_advertises_effective_foreground_mode_over_http(
+    _startup, monkeypatch, env, child, flag, enabled
+):
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from gateway.config import GatewayConfig, PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    monkeypatch.delenv("HERMES_GATEWAY_NO_SUPERVISE", raising=False)
+    monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+    if env is not None:
+        monkeypatch.setenv("HERMES_GATEWAY_NO_SUPERVISE", env)
+    if child:
+        monkeypatch.setenv("HERMES_S6_SUPERVISED_CHILD", "1")
+    _, state, _ = _startup
+    assert await run_bootstrap.start_gateway(
+        config=GatewayConfig(), verbosity=None, no_supervise=flag)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "secret"}))
+    adapter.gateway_runner = state["runner"]
+    app = web.Application()
+    for method, path, handler in adapter._http_route_table():
+        app.router.add_route(method, path, handler)
+    async with TestClient(TestServer(app)) as client:
+        response = await client.get("/v1/health", headers={"Authorization": "Bearer secret"})
+        assert response.status == 200
+        assert (await response.json())["worker_safety"]["no_respawn_enabled"] is enabled
+
+
+@pytest.mark.asyncio
 async def test_control_only_preserves_unclean_lifecycle_evidence_and_defers_scan(
     _startup, monkeypatch, tmp_path
 ):

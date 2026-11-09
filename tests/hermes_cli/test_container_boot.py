@@ -156,6 +156,61 @@ def test_control_only_container_command_suppresses_every_s6_gateway_autostart(tm
     assert not any(action.folded_into_root for action in actions)
 
 
+@pytest.mark.parametrize("mode", ["flag", "env"])
+def test_no_supervise_fresh_volume_stays_down_without_seeding_intent(tmp_path, monkeypatch, mode):
+    monkeypatch.delenv("HERMES_GATEWAY_NO_SUPERVISE", raising=False)
+    argv = ["hermes", "gateway", "run"]
+    if mode == "flag":
+        argv.append("--no-supervise")
+    else:
+        monkeypatch.setenv("HERMES_GATEWAY_NO_SUPERVISE", "1")
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=tmp_path / "svc", container_argv=argv)
+    assert actions[0].action == "registered"
+    assert (tmp_path / "svc" / "gateway-default" / "down").exists()
+    assert not (tmp_path / "gateway_state.json").exists()
+
+
+@pytest.mark.parametrize("mode", ["flag", "env"])
+@pytest.mark.parametrize("root_state", ["running", "draining", "degraded", None])
+def test_no_supervise_preserves_persisted_intent_and_registers_all_slots_down(
+    tmp_path, monkeypatch, mode, root_state
+):
+    monkeypatch.delenv("HERMES_GATEWAY_NO_SUPERVISE", raising=False)
+    if mode == "env":
+        monkeypatch.setenv("HERMES_GATEWAY_NO_SUPERVISE", "1")
+    argv = ["/init", "/opt/hermes/docker/main-wrapper.sh", "hermes", "gateway", "run"]
+    if mode == "flag":
+        argv.append("--no-supervise")
+    _seed_default_root(tmp_path, state=root_state)
+    named = _make_profile(tmp_path, "named", state="degraded")
+    solo = _make_profile(tmp_path, "solo", state="draining")
+    (solo / "config.yaml").write_text("gateway:\n  standalone: true\n", encoding="utf-8")
+    state_files = [p / "gateway_state.json" for p in (tmp_path, named, solo) if (p / "gateway_state.json").exists()]
+    before = {p: p.read_bytes() for p in state_files}
+
+    actions = reconcile_profile_gateways(hermes_home=tmp_path, scandir=tmp_path / "svc", container_argv=argv)
+
+    assert all(a.action == "registered" and not a.folded_into_root for a in actions)
+    assert all((tmp_path / "svc" / f"gateway-{a.profile}" / "down").exists() for a in actions)
+    assert {p: p.read_bytes() for p in state_files} == before
+    if root_state is None:
+        assert not (tmp_path / "gateway_state.json").exists()
+
+
+def test_default_boot_still_autostarts_folded_and_standalone_intent(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_GATEWAY_NO_SUPERVISE", raising=False)
+    _make_profile(tmp_path, "named", state="degraded")
+    solo = _make_profile(tmp_path, "solo", state="draining")
+    (solo / "config.yaml").write_text("gateway:\n  standalone: true\n", encoding="utf-8")
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path, scandir=tmp_path / "svc", container_argv=["hermes", "gateway", "run"])
+    assert {a.profile: a.action for a in actions} == {
+        "default": "started", "named": "registered", "solo": "started"}
+    assert not (tmp_path / "svc" / "gateway-default" / "down").exists()
+    assert not (tmp_path / "svc" / "gateway-solo" / "down").exists()
+
+
 def test_control_only_parser_and_container_detection_agree():
     import argparse
 
