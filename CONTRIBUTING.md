@@ -774,6 +774,17 @@ that touches the OS, assume *any* platform can hit your code path.
 > common Windows-unsafe patterns in your diff. It's grep-based and cheap;
 > CI runs it on every PR too.
 
+### Linux container builds on Windows
+
+Docker copies working-tree bytes, not Git's normalized index. Keep LF endings
+for `docker/s6-rc.d/` service definitions and `docker/cont-init.d/` hooks,
+including extensionless `type`, `run`, and `finish` files. CRLF makes s6 reject
+service types or prevents Linux from executing their shebangs.
+
+Existing Windows checkouts predating these attributes must refresh the clean
+service paths before rebuilding. Commit or stash local service-file edits first;
+do not discard them to refresh line endings.
+
 ### Critical rules
 
 1. **Never call `os.kill(pid, 0)` for liveness checks.** `os.kill(pid, 0)`
