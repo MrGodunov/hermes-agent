@@ -93,6 +93,7 @@ def _retire_admission_workers(conn, row, owner_epoch):
     lineage = json.loads(row['lineage_json'])
     targets = list({row['target_session_id'], lineage[-1] if lineage else row['target_session_id']})
     scope = f"session_id IN ({','.join('?' * len(targets))}) AND generation=? AND owner_epoch=?"
+    conn.execute("DELETE FROM session_turn_leases WHERE owner_admission_id=?", (row['admission_id'],))
     # Settlement closes an execution that never wrote execution.finish: its read copies go too.
     from hermes_state_runtime_workers import compact_terminal_receipts
     for (execution_id,) in conn.execute(f"SELECT execution_id FROM worker_executions WHERE {scope} "
@@ -735,6 +736,14 @@ def _linked_worker_admission(conn, session_id, generation, owner_epoch, statuses
     return rows[0] if rows else None
 
 
+def _worker_lease_admission(conn, execution_id):
+    worker = conn.execute('SELECT session_id,generation,owner_epoch FROM worker_executions '
+                          'WHERE execution_id=?', (execution_id,)).fetchone()
+    row = _linked_worker_admission(conn, worker['session_id'], worker['generation'],
+                                   worker['owner_epoch'], ('started',))
+    return row['admission_id'] if row is not None else None
+
+
 def _secret_digest(secret):
     import hashlib
     _text(secret)
@@ -854,9 +863,8 @@ def _worker_append(db, conn, session_id, payload):
     return {'count': count, 'annotations': row_annotations(messages)}
 
 
-def _worker_turn(db, conn, session_id, payload, operation):
+def _worker_turn(db, conn, session_id, payload, operation, execution_id):
     import time
-    from hermes_state_compression import _claim_lease_row
     from hermes_state import _compression_lock_holder_process_is_dead
     allowed = {'holder'} if operation == 'turn.release' else {'holder', 'ttl_seconds'}
     if set(payload) != allowed:
@@ -867,15 +875,28 @@ def _worker_turn(db, conn, session_id, payload, operation):
         raise RuntimeStoreError('invalid_params')
     key = db._session_turn_lease_key_on_conn(conn, session_id)
     now = time.time()
+    owner = _worker_lease_admission(conn, execution_id)
     if operation == 'turn.acquire':
-        value = _claim_lease_row(conn, 'session_turn_leases', 'conversation_id', key,
-            holder, now, now + ttl,
-            lambda h, e: float(e) <= now or _compression_lock_holder_process_is_dead(h))[0]
+        current = conn.execute('SELECT holder,expires_at,owner_admission_id FROM session_turn_leases '
+                               'WHERE conversation_id=?', (key,)).fetchone()
+        if current is not None and (float(current['expires_at']) <= now
+                                    or _compression_lock_holder_process_is_dead(current['holder'])):
+            conn.execute('DELETE FROM session_turn_leases WHERE conversation_id=?', (key,))
+            current = None
+        if current is None:
+            conn.execute('INSERT INTO session_turn_leases '
+                         '(conversation_id,holder,acquired_at,expires_at,owner_admission_id) VALUES (?,?,?,?,?)',
+                         (key, holder, now, now + ttl, owner))
+            value = True
+        else:
+            value = current['holder'] == holder and current['owner_admission_id'] == owner
     elif operation == 'turn.renew':
-        value = conn.execute('UPDATE session_turn_leases SET expires_at=? WHERE conversation_id=? AND holder=?',
-                             (now + ttl, key, holder)).rowcount > 0
+        value = conn.execute('UPDATE session_turn_leases SET expires_at=? WHERE conversation_id=? '
+                             'AND holder=? AND owner_admission_id IS ?',
+                             (now + ttl, key, holder, owner)).rowcount > 0
     else:
-        conn.execute('DELETE FROM session_turn_leases WHERE conversation_id=? AND holder=?', (key, holder))
+        conn.execute('DELETE FROM session_turn_leases WHERE conversation_id=? AND holder=? '
+                     'AND owner_admission_id IS ?', (key, holder, owner))
         value = None
     return {'value': value}
 
@@ -942,6 +963,8 @@ def mutate_worker_execution(db, *, epoch, execution_id, session_id, generation,
     handlers = {
         **WORKER_LIFECYCLE_HANDLERS,
         **WORKER_COMPRESSION_HANDLERS,
+        'turn.cleanup': lambda db, conn, sid, p: WORKER_COMPRESSION_HANDLERS['turn.cleanup'](
+            db, conn, sid, p, execution_id),
         'session.context': worker_context,
         'session.prompt': worker_prompt,
         'session.sidecars': worker_sidecars,
@@ -952,7 +975,7 @@ def mutate_worker_execution(db, *, epoch, execution_id, session_id, generation,
         'execution.finish': _worker_finish,
         'usage.main': _worker_usage,
         'usage.auxiliary': lambda db, conn, sid, p: _worker_usage(db, conn, sid, p, auxiliary=True),
-        **{name: (lambda db, conn, sid, p, op=name: _worker_turn(db, conn, sid, p, op))
+        **{name: (lambda db, conn, sid, p, op=name: _worker_turn(db, conn, sid, p, op, execution_id))
            for name in ('turn.acquire', 'turn.renew', 'turn.release')},
     }
     return apply_worker_receipt(db, epoch=epoch, execution_id=execution_id, session_id=session_id,

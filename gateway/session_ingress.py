@@ -329,6 +329,9 @@ async def execute_admission(authority, ref, row):
     api_token = api_execution.set(None)
     captured = {}
     result_token = execution_result.set(captured)
+    from agent.turn_facade_lease import admission_turn_scope
+    lease_token = admission_turn_scope.set(
+        (authority.db, authority.epoch, row['admission_id'], row['generation'], row['target_session_id']))
     token = executing_admission.set(True)
     # This drain, not the handler's unwind, releases the turn's crash marker (see below).
     event._turn_marker_handoff = True
@@ -387,6 +390,7 @@ async def execute_admission(authority, ref, row):
         if not handed:
             await _release_turn_marker(authority, event)
         executing_admission.reset(token)
+        admission_turn_scope.reset(lease_token)
         execution_result.reset(result_token)
         api_execution.reset(api_token)
         admission_author.reset(author_token)

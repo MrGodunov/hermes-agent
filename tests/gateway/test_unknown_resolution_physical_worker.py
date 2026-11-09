@@ -86,3 +86,38 @@ def test_resolve_unknown_retires_the_physical_worker_row(tmp_path):
         finally:
             child.kill()
             child.wait(timeout=5)
+
+
+def test_local_reset_raw_turn_lease_retires_without_touching_other_session(tmp_path):
+    import threading
+    from agent.turn_facade_lease import admission_turn_scope, admit_durable_turn_lease
+
+    with closing(SessionDB(tmp_path / 'state.db')) as db:
+        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        logical = _local_reset(db, epoch, 'logical', 'physical')
+        db.create_session('unrelated', source='test', parent_session_id=logical,
+                          model_config={'_branched_from': logical})
+        accepted = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id=logical,
+                                          request_id='first', payload={'text': 'first'})
+        row = rt.claim_session_input(db, epoch=epoch, session_id=logical)
+        token = admission_turn_scope.set((db, epoch, row['admission_id'], row['generation'], logical))
+        leases = []
+        try:
+            for sid in ('physical', 'unrelated'):
+                agent = SimpleNamespace(_session_db=db, session_id=sid,
+                                        _liveness_activity_lock=lambda: threading.Lock())
+                result = admit_durable_turn_lease(
+                    agent, session_id=sid, relay_turn_id=sid,
+                    task_context={'session_id': sid, 'platform': 'cli'}, conversation_history=[])
+                assert result.lease is not None
+                leases.append(result.lease)
+        finally:
+            admission_turn_scope.reset(token)
+        epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
+        rt.recover_session_inputs(db, epoch=epoch)
+        args = dict(epoch=epoch, admission_id=accepted['admission_id'], generation=row['generation'])
+        rt.resolve_unknown_session_input(db, **args)
+        assert db.try_acquire_session_turn_lease('physical', 'follower')
+        assert not db.try_acquire_session_turn_lease('unrelated', 'contender')
+        for lease in leases:
+            lease.release()

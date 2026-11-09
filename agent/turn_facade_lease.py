@@ -8,6 +8,7 @@ timers run via the shared scheduler (``agent/periodic_scheduler.py``; timer thre
 bodies run on per-handle workers), not per-turn threads.
 """
 import logging
+from contextvars import ContextVar
 import os
 import threading
 import time
@@ -19,6 +20,9 @@ from hermes_state_pidns import holder_namespace_token
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
+
+# Set for a canonical in-process admission, never on a shared DB handle.
+admission_turn_scope = ContextVar("admission_turn_scope", default=None)
 
 # ``tool_reason`` for a lost session turn lease: attributes the stop to the lease, not the user (#112647).
 _REASON_LEASE_LOST = "session turn lease lost"
@@ -39,11 +43,13 @@ class DurableTurnLease:
     written only under ``_lock``.
     """
 
-    def __init__(self, agent, db, session_id: str, holder: str, *, expires_at: Optional[float] = None) -> None:
+    def __init__(self, agent, db, session_id: str, holder: str, *, expires_at: Optional[float] = None,
+                 admission_scope=None) -> None:
         self.agent = agent
         self.db = db
         self.session_id = session_id  # id at admission; release always targets this row
         self.holder = holder
+        self.admission_scope = admission_scope
         # Wall clock, same as the row's expires_at, never later than it: the row's committed expiry at
         # admission, then a timestamp taken BEFORE each successful renewal (the store stamps expiry
         # before its lock wait). Only a successful renewal moves it.
@@ -116,7 +122,8 @@ class DurableTurnLease:
         """Release the row and drop the agent's holder attrs (only if they still name this lease)."""
         agent = self.agent
         try:
-            self.db.release_session_turn_lease(self.session_id, self.holder)
+            kwargs = {} if self.admission_scope is None else {'_admission_scope': self.admission_scope}
+            self.db.release_session_turn_lease(self.session_id, self.holder, **kwargs)
         except Exception:
             logger.error("Failed to release session turn lease: %s", self.session_id, exc_info=True)
         if getattr(agent, "_active_session_turn_lease_holder", None) == self.holder:
@@ -222,9 +229,10 @@ class DurableTurnLease:
         if patience <= 0:
             return self._stop_on_exhausted_authority()
         try:
+            kwargs = {} if self.admission_scope is None else {'_admission_scope': self.admission_scope}
             if self.db.refresh_session_turn_lease(
                 self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS,
-                patience_s=min(_REFRESH_WRITE_PATIENCE_S, patience),
+                patience_s=min(_REFRESH_WRITE_PATIENCE_S, patience), **kwargs,
             ):
                 self._authority_deadline = started + LEASE_TTL_SECONDS
                 return None
@@ -344,10 +352,15 @@ def admit_durable_turn_lease(
         )
 
     authority_floor = time.time()  # every acquisition attempt stamps its expiry after this instant
+    scope = admission_turn_scope.get()
+    scoped = {}
+    if scope is not None and scope[0] is db:
+        if db._admission_turn_applies(session_id, scope[4]):
+            scoped['_admission_scope'] = scope[1:4]
     if not db.acquire_session_turn_lease(
         session_id, holder, ttl_seconds=LEASE_TTL_SECONDS, wait_seconds=LEASE_WAIT_SECONDS,
         on_wait=_on_wait, on_contended=_on_contended,
-        should_abort=lambda: getattr(agent, "_interrupt_requested", False),
+        should_abort=lambda: getattr(agent, "_interrupt_requested", False), **scoped,
     ):
         admission.early_result = _lease_not_acquired_result(agent, session_id, conversation_history,
                                                             waited=announced)
@@ -357,6 +370,7 @@ def admit_durable_turn_lease(
     # row; persist paths read the agent attr so a late flush is fenced in the same transaction.
     lease = DurableTurnLease(
         agent, db, session_id, holder, expires_at=_committed_lease_expiry(db, session_id, holder, authority_floor),
+        admission_scope=scoped.get('_admission_scope'),
     )
     agent._active_session_turn_lease_holder = holder
     agent._active_session_turn_lease_ttl_seconds = LEASE_TTL_SECONDS

@@ -443,7 +443,7 @@ def worker_compression_append(db, conn, sid, payload):
     return {'count': count, 'annotations': row_annotations(payload['messages'])}
 
 
-def worker_turn_cleanup(db, conn, sid, payload):
+def worker_turn_cleanup(db, conn, sid, payload, execution_id):
     _fields(payload, ('target', 'holder'))
     target = _text(payload['target'])
     holder = _text(payload['holder'])
@@ -451,7 +451,10 @@ def worker_turn_cleanup(db, conn, sid, payload):
     key = db._session_turn_lease_key_on_conn(conn, sid)
     if key != db._session_turn_lease_key_on_conn(conn, target):
         raise RuntimeStoreError('permission_denied')
-    conn.execute('DELETE FROM session_turn_leases WHERE conversation_id=? AND holder=?', (key, holder))
+    from hermes_state_runtime import _worker_lease_admission
+    owner = _worker_lease_admission(conn, execution_id)
+    conn.execute('DELETE FROM session_turn_leases WHERE conversation_id=? AND holder=? '
+                 'AND owner_admission_id IS ?', (key, holder, owner))
     return {'released': True}
 
 

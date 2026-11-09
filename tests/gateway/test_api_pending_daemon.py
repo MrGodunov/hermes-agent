@@ -6,6 +6,7 @@ import shlex
 import os
 from pathlib import Path
 import socket
+import sqlite3
 import threading
 
 import aiohttp
@@ -96,6 +97,12 @@ def test_api_and_ws_pending_controls_share_identity(tmp_path):
                     async with client.get(url + '/' + run) as response:
                         projected = await response.json()
                     assert projected['pending_controls'] == [prompt], projected
+                    with sqlite3.connect(home / 'state.db') as state:
+                        lease = state.execute(
+                            "SELECT holder,owner_admission_id FROM session_turn_leases "
+                            "WHERE conversation_id=?", ('api-controls',)).fetchone()
+                    assert lease is not None and lease[0] and lease[1] == projected['admission_id'], (
+                        lease, projected)
                     body = {'request_id': prompt['prompt_id'], 'execution_generation': prompt['execution_generation']}
                     body.update({'choice': 'once'} if kind == 'approval' else {'answer': 'BLUE'})
                     path = '/' + run + ('/approval' if kind == 'approval' else '/clarify')

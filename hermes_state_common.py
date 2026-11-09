@@ -718,7 +718,8 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     conversation_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
     acquired_at REAL NOT NULL,
-    expires_at REAL NOT NULL
+    expires_at REAL NOT NULL,
+    owner_admission_id TEXT
 );
 
 CREATE TABLE IF NOT EXISTS async_delegations (

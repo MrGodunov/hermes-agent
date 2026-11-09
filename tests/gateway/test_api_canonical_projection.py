@@ -70,6 +70,96 @@ async def test_api_images_are_committed_media_in_canonical_history(api, owner):
 
 
 @pytest.mark.asyncio
+async def test_api_turn_lease_is_retired_with_its_unknown_admission(api, owner):
+    from agent.turn_facade_lease import admit_durable_turn_lease
+    from hermes_state_runtime import (begin_runtime_epoch, claim_session_input, recover_session_inputs,
+                                      resolve_unknown_session_input)
+    import threading
+
+    _, ref, accepted = admit_api_turn(api, session_id='lease-api', user_message='hello',
+                                      conversation_history=[])
+    row = claim_session_input(owner.db, epoch=owner.epoch, session_id=ref.session_id)
+    agent = SimpleNamespace(_session_db=owner.db, session_id=ref.session_id,
+                            _liveness_activity_lock=lambda: threading.Lock())
+    held = {}
+
+    async def handle(event):
+        from gateway.session_results import execution_result
+        held['admission'] = await asyncio.to_thread(
+            admit_durable_turn_lease, agent, session_id=ref.session_id, relay_turn_id='api-turn',
+            task_context={'session_id': ref.session_id, 'platform': 'api_server'},
+            conversation_history=[])
+        assert held['admission'].lease is not None
+        assert not owner.db.try_acquire_session_turn_lease(ref.session_id, 'follower')
+        execution_result.get()['result'] = {'final_response': 'ok'}
+        return 'ok'
+
+    owner.runner._handle_message = handle
+    await execute_admission(owner, ref, row)
+    new_epoch = begin_runtime_epoch(owner.db, instance_id='replacement')
+    recover_session_inputs(owner.db, epoch=new_epoch)
+    args = dict(epoch=new_epoch, admission_id=accepted['admission_id'], generation=row['generation'])
+    resolved = resolve_unknown_session_input(owner.db, **args)
+    assert resolve_unknown_session_input(owner.db, **args) == resolved
+    assert owner.db.try_acquire_session_turn_lease(ref.session_id, 'follower')
+    held['admission'].lease.release()
+    assert not owner.db.try_acquire_session_turn_lease(ref.session_id, 'third')
+
+
+
+@pytest.mark.asyncio
+async def test_cached_api_agent_gets_each_claim_and_child_leases_stay_unbound(api, owner, tmp_path):
+    import threading
+    from agent.turn_facade_lease import admit_durable_turn_lease
+    from hermes_state import SessionDB
+    from hermes_state_runtime import (begin_runtime_epoch, claim_session_input, recover_session_inputs,
+                                      resolve_unknown_session_input, settle_session_input)
+
+    other_db = SessionDB(tmp_path / 'other-state.db')
+    other_db.create_session('cached-api', source='test')
+    owner.db.create_session('child', source='test')
+    agent = SimpleNamespace(_session_db=owner.db, session_id='cached-api',
+                            _liveness_activity_lock=lambda: threading.Lock())
+    retained = []
+    try:
+        async def handle(event):
+            from gateway.session_results import execution_result
+            async def acquire(db, sid):
+                subject = agent if db is owner.db and sid == 'cached-api' else SimpleNamespace(
+                    _session_db=db, session_id=sid, _liveness_activity_lock=lambda: threading.Lock())
+                return (await asyncio.to_thread(
+                    admit_durable_turn_lease, subject, session_id=sid, relay_turn_id='same',
+                    task_context={'session_id': sid, 'platform': 'api_server'}, conversation_history=[])).lease
+            retained.append(await acquire(owner.db, 'cached-api'))
+            if len(retained) == 2:
+                retained.append(await acquire(owner.db, 'child'))
+                retained.append(await acquire(other_db, 'cached-api'))
+            execution_result.get()['result'] = {'final_response': 'ok'}
+            return 'ok'
+
+        owner.runner._handle_message = handle
+        for index in range(2):
+            _, ref, accepted = admit_api_turn(api, session_id='cached-api', request_id=f'run-{index}',
+                                              user_message='hello', conversation_history=[])
+            row = claim_session_input(owner.db, epoch=owner.epoch, session_id=ref.session_id)
+            await execute_admission(owner, ref, row)
+            if index == 0:
+                retained[0].release()
+                settle_session_input(owner.db, epoch=owner.epoch, admission_id=accepted['admission_id'],
+                                     generation=row['generation'], outcome='completed')
+        epoch = begin_runtime_epoch(owner.db, instance_id='replacement')
+        recover_session_inputs(owner.db, epoch=epoch)
+        resolve_unknown_session_input(owner.db, epoch=epoch, admission_id=accepted['admission_id'],
+                                      generation=row['generation'])
+        assert owner.db.try_acquire_session_turn_lease('cached-api', 'follower')
+        assert not owner.db.try_acquire_session_turn_lease('child', 'follower')
+        assert not other_db.try_acquire_session_turn_lease('cached-api', 'follower')
+    finally:
+        for lease in retained:
+            lease.release()
+        other_db.close()
+
+@pytest.mark.asyncio
 async def test_initialization_failure_is_a_failed_receipt_not_completed(api, owner):
     _, ref, row = admit_api_turn(api, session_id='init', user_message='hello', conversation_history=[])
 

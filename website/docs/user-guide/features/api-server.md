@@ -631,6 +631,10 @@ generation, or a run that is not currently unknown, returns `409 stale_generatio
 an admission ID that does not belong to the path run returns `409 not_found`. The
 body must contain exactly those two fields, or the server returns `400 invalid_params`.
 
+Resolution also retires a turn lease only when it is durably bound to that exact
+admission. Unbound legacy or local leases and leases belonging to other
+admissions remain subject to normal lease expiry and release rules.
+
 Hosted-room homes resolve a member's `unknown` run this way on their next poll and
 settle the room task as interrupted ("member gateway restarted"). A room home on an
 older release does not know the `unknown` status and reports a mismatched run status

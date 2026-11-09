@@ -15,6 +15,23 @@ from hermes_state import SessionDB
 from hermes_state_errors import SessionTurnLeaseLostError
 
 
+def test_legacy_turn_lease_schema_upgrade_preserves_live_lease(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    db.create_session("shared", source="test")
+    assert db.try_acquire_session_turn_lease("shared", "legacy", ttl_seconds=300)
+    db.close()
+    with sqlite3.connect(path) as conn:
+        conn.execute("ALTER TABLE session_turn_leases DROP COLUMN owner_admission_id")
+    db = SessionDB(path)
+    try:
+        assert not db.try_acquire_session_turn_lease("shared", "contender")
+        db.release_session_turn_lease("shared", "legacy")
+        assert db.try_acquire_session_turn_lease("shared", "contender")
+    finally:
+        db.close()
+
+
 def test_turn_lease_serializes_separate_session_db_instances(tmp_path):
     """A second process-shaped DB handle waits for the current turn owner."""
     path = tmp_path / "state.db"

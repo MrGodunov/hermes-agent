@@ -716,8 +716,20 @@ class SessionCompressionMixin:
         with self._read_ctx() as conn:
             return self._session_turn_lease_key_on_conn(conn, session_id)
 
+    def _admission_turn_applies_on_conn(self, conn, session_id: str, target_session_id: str) -> bool:
+        """Match the current trusted physical target and its preferred compression continuations."""
+        from hermes_state_local_lineage import local_physical_target
+        physical = local_physical_target(conn, target_session_id)
+        return session_id in _walk_compression_chain(
+            physical, lambda current: conn.execute(_CHAIN_STEP_SQL, (current,)).fetchone())
+
+    def _admission_turn_applies(self, session_id: str, target_session_id: str) -> bool:
+        with self._read_ctx() as conn:
+            return self._admission_turn_applies_on_conn(conn, session_id, target_session_id)
+
     def try_acquire_session_turn_lease(
         self, session_id: str, holder: str, *, ttl_seconds: float = 300.0, patience_s: Optional[float] = None,
+        _admission_scope=None,
     ) -> bool:
         """Atomically acquire the cross-process turn lease for a conversation (keyed by the
         lineage root). The walk, the INSERT, and reclaim of expired or dead-local-PID leases
@@ -735,17 +747,44 @@ class SessionCompressionMixin:
             conn.execute("DELETE FROM session_turn_leases WHERE expires_at < ?",
                          (now - _TURN_LEASE_SWEEP_GRACE_S,))
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
-            return _claim_lease_row(
+            if _admission_scope is not None:
+                from hermes_state_runtime import _admission, _epoch, _session, RuntimeStoreError
+                epoch, admission_id, generation = _admission_scope
+                _epoch(conn, epoch)
+                admission = _admission(conn, admission_id)
+                if (admission['status'] != 'started' or admission['owner_epoch'] != epoch
+                        or admission['generation'] != generation
+                        or not self._admission_turn_applies_on_conn(conn, session_id, admission['target_session_id'])
+                        or _session(conn, admission['target_session_id'])['runtime_generation'] != generation):
+                    raise RuntimeStoreError('stale_generation')
+                current = conn.execute(
+                    "SELECT holder,expires_at,owner_admission_id FROM session_turn_leases WHERE conversation_id=?",
+                    (conversation_id,)).fetchone()
+                if current is not None and (float(current['expires_at']) <= now
+                        or _compression_lock_holder_process_is_dead(current['holder'])):
+                    conn.execute("DELETE FROM session_turn_leases WHERE conversation_id=?", (conversation_id,))
+                    current = None
+                if current is None:
+                    conn.execute("INSERT INTO session_turn_leases "
+                                 "(conversation_id,holder,acquired_at,expires_at,owner_admission_id) "
+                                 "VALUES (?,?,?,?,?)", (conversation_id, holder, now, expires_at, admission_id))
+                    return True
+                return current['holder'] == holder and current['owner_admission_id'] == admission_id
+            acquired = _claim_lease_row(
                 conn, "session_turn_leases", "conversation_id", conversation_id, holder, now, expires_at,
                 lambda h, e: float(e) <= now or _compression_lock_holder_process_is_dead(h),
             )[0]
+            if acquired:
+                conn.execute("UPDATE session_turn_leases SET owner_admission_id=NULL "
+                             "WHERE conversation_id=? AND holder=?", (conversation_id, holder))
+            return acquired
         return bool(self._execute_write(_do, patience_s=patience_s))
 
     def acquire_session_turn_lease(
         self, session_id: str, holder: str, *, ttl_seconds: float = 300.0,
         wait_seconds: float = 1800.0, poll_interval_seconds: float = 1.0, on_wait=None,
         wait_notice_interval_seconds: float = 15.0, should_abort=None, acquire_patience_s: float = 0.5,
-        on_contended=None,
+        on_contended=None, _admission_scope=None,
     ) -> bool:
         """Wait for a cross-process turn lease without holding a SQLite lock. ``on_wait(elapsed)`` is
         best-effort: called when another holder has the lease and about every
@@ -767,8 +806,9 @@ class SessionCompressionMixin:
                 except Exception:
                     logger.debug("session turn lease should_abort callback failed", exc_info=True)
             try:
+                kwargs = {} if _admission_scope is None else {'_admission_scope': _admission_scope}
                 if self.try_acquire_session_turn_lease(
-                    session_id, holder, ttl_seconds=ttl_seconds, patience_s=patience):
+                    session_id, holder, ttl_seconds=ttl_seconds, patience_s=patience, **kwargs):
                     return True
             except sqlite3.Error as exc:
                 # Another writer's transaction outlasted the write patience. That is not a lease
@@ -816,6 +856,7 @@ class SessionCompressionMixin:
 
     def refresh_session_turn_lease(
         self, session_id: str, holder: str, *, ttl_seconds: float = 300.0, patience_s: Optional[float] = None,
+        _admission_scope=None,
     ) -> bool:
         """Extend a turn lease only while ``holder`` still owns it. ``expires_at`` is stamped before
         the write-lock wait, so a caller timestamp taken before this call never exceeds it."""
@@ -824,18 +865,31 @@ class SessionCompressionMixin:
         expires_at = time.time() + max(0.1, float(ttl_seconds))
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            if _admission_scope is not None:
+                epoch, admission_id, generation = _admission_scope
+                return conn.execute(
+                    "UPDATE session_turn_leases SET expires_at=? WHERE conversation_id=? AND holder=? "
+                    "AND owner_admission_id=? AND EXISTS (SELECT 1 FROM session_admissions a "
+                    "JOIN runtime_epoch e ON e.singleton=1 WHERE a.admission_id=? AND a.status='started' "
+                    "AND a.owner_epoch=? AND a.generation=? AND e.epoch=?)",
+                    (expires_at, conversation_id, holder, admission_id, admission_id, epoch, generation, epoch),
+                ).rowcount > 0
             return conn.execute(
                 "UPDATE session_turn_leases SET expires_at = ? "
                 "WHERE conversation_id = ? AND holder = ?", (expires_at, conversation_id, holder),
             ).rowcount > 0
         return bool(self._execute_write(_do, patience_s=patience_s))
 
-    def release_session_turn_lease(self, session_id: str, holder: str) -> None:
+    def release_session_turn_lease(self, session_id: str, holder: str, *, _admission_scope=None) -> None:
         """Release a turn lease iff ``holder`` still owns it; idempotent."""
         if not session_id or not holder:
             return
         def _do(conn):
             conversation_id = self._session_turn_lease_key_on_conn(conn, session_id)
+            if _admission_scope is not None:
+                conn.execute("DELETE FROM session_turn_leases WHERE conversation_id=? AND holder=? "
+                             "AND owner_admission_id=?", (conversation_id, holder, _admission_scope[1]))
+                return
             conn.execute(
                 "DELETE FROM session_turn_leases WHERE conversation_id = ? AND holder = ?",
                 (conversation_id, holder))
